@@ -1,87 +1,97 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
-from textblob import TextBlob
 import transformers
 
-# Optional: suppress verbosity warnings from transformers
 transformers.logging.set_verbosity_error()
 
+
 class CoreController:
-    def __init__(self, model_type="nous", model_name=None):
-        """
-        Initialize the model based on the chosen type.
-        """
-        self.model_type = model_type
-        self.model_name = model_name
+    def __init__(self, model_type="phi1.5", model_name=None):
+        self.available_models = {
+            "gpt2": "gpt2",
+            "phi1.5": "microsoft/phi-1.5",
+            "nous": "NousResearch/Nous-Hermes-2-Mistral-7B-DPO",
+            "qwen2.5": "Qwen/Qwen2-0.5B"
+        }
 
-        if model_type == "gpt2":
-            self.model_name = model_name or "gpt2"
-        elif model_type == "nous":
-            self.model_name = model_name or "NousResearch/Nous-Hermes-2-Mistral-7B-DPO"
-        elif model_type == "phi1.5":
-            self.model_name = model_name or "microsoft/phi-1.5"
-        elif model_type == "qwen2.5":
-            self.model_name = model_name or "Qwen/Qwen2-0.5B"
-        else:
-            raise ValueError(f"Unsupported model_type: {model_type}")
+        self.models = {}        # Cache of loaded models
+        self.tokenizers = {}    # Cache of loaded tokenizers
+        self.devices = {}       # Store devices per model
 
-        self._load_model()
         self.sentiment_analysis = pipeline("sentiment-analysis")
 
-    def _load_model(self):
-        try:
-            print(f"Loading model: {self.model_name}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None,
-                trust_remote_code=True
-            )
-            self.model.eval()
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-        except Exception as e:
-            raise RuntimeError(f"Error loading model {self.model_name}: {str(e)}")
+        # Load default model
+        self.current_model_key = model_type
+        self._load_model(model_type, model_name)
 
-    def _generate_empathy_prompt(self, user_input):
-        empathy_phrases = [
-            "I'm so sorry you're feeling this way.",
-            "It's completely okay to feel how you are feeling right now.",
-            "I'm here to listen and help you through this.",
-            "You're not alone in this, and it's great you're reaching out."
-        ]
+    def _load_model(self, model_type, custom_model_name=None):
+        """
+        Load and cache a model/tokenizer. Use cached version if already loaded.
+        """
+        model_key = model_type.lower()
+        model_name = custom_model_name or self.available_models.get(model_key)
 
-        sentiment = self.sentiment_analysis(user_input)[0]['label']
-        if sentiment == 'NEGATIVE':
-            empathy_prompt = f"{empathy_phrases[0]} I understand that things might be tough right now. Let me know how I can help."
-        elif sentiment == 'POSITIVE':
-            empathy_prompt = f"{empathy_phrases[3]} It sounds like you're feeling good, but I'm here for you if you need anything."
+        if not model_name:
+            raise ValueError(f"Unsupported model type: {model_type}")
+
+        if model_key in self.models:
+            print(f"✅ Using cached model: {model_key}")
         else:
-            empathy_prompt = f"{empathy_phrases[1]} I'm here to support you in any way I can."
+            print(f"🔄 Loading new model: {model_name}")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-        return empathy_prompt
-    
+            if torch.cuda.is_available():
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+                device = torch.device("cuda")
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float32,
+                    trust_remote_code=True
+                )
+                device = torch.device("cpu")
+                model.to(device)
+
+            model.eval()
+
+            self.models[model_key] = model
+            self.tokenizers[model_key] = tokenizer
+            self.devices[model_key] = device
+
+        # Set active model/tokenizer/device
+        self.current_model_key = model_key
+        self.model = self.models[model_key]
+        self.tokenizer = self.tokenizers[model_key]
+        self.device = self.devices[model_key]
+
+    def switch_model(self, model_type, model_name=None):
+        """
+        Public method to switch models dynamically.
+        """
+        self._load_model(model_type, model_name)
+
     def conv(self, user_input, max_new_tokens=150):
-        # Use sentiment to guide model tone — not to hardcode response
         sentiment = self.sentiment_analysis(user_input)[0]['label']
 
-        # Updated system prompt without "Suggested empathy:"
         system_prompt = (
-            "You are a compassionate and supportive mental health assistant. "
-            "You listen carefully, respond with empathy, and provide helpful guidance. "
-            "You are not a doctor and do not give medical advice, but you offer emotional support and encouragement. "
-            "Always respond in a calm, caring, and non-judgmental way."
         )
 
-        # Let the model generate based on the user's message
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        # Check if the tokenizer supports chat template
+        if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input},
+            ]
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = f"{system_prompt}\n\nUser: {user_input}\nAssistant:"
 
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        print("Formatted prompt:\n", prompt)
+        print(f"[{self.current_model_key}] Prompt:\n", prompt)
 
         try:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
@@ -99,9 +109,9 @@ class CoreController:
 
             response = self.tokenizer.decode(output_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
             print("Generated response:", response)
-
             return response.strip()
 
         except Exception as e:
-            print(f"Error during response generation: {str(e)}")
-            return "I'm sorry, I wasn't able to generate a response. Could you try again later."
+            print(f"Error during generation with model '{self.current_model_key}': {str(e)}")
+            return "I'm sorry, I couldn't generate a response. Please try again later."
+
